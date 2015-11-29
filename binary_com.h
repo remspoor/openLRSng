@@ -21,6 +21,7 @@ bool binary_mode_active = false;
 #define PSP_REQ_RX_FAILSAFE             9
 #define PSP_REQ_TX_CONFIG               10
 #define PSP_REQ_PPM_IN                  11
+#define PSP_REQ_DEFAULT_PROFILE         12
 
 #define PSP_SET_BIND_DATA               101
 #define PSP_SET_RX_CONFIG               102
@@ -31,6 +32,7 @@ bool binary_mode_active = false;
 #define PSP_SET_ACTIVE_PROFILE          107
 #define PSP_SET_RX_FAILSAFE             108
 #define PSP_SET_TX_CONFIG               109
+#define PSP_SET_DEFAULT_PROFILE         110
 
 #define PSP_SET_EXIT                    199
 
@@ -39,12 +41,13 @@ bool binary_mode_active = false;
 #define PSP_INF_CRC_FAIL                203
 #define PSP_INF_DATA_TOO_LONG           204
 
+extern volatile uint8_t ppmAge;
 extern struct rxSpecialPinMap rxcSpecialPins[];
 extern uint8_t rxcSpecialPinCount;
 extern uint8_t rxcNumberOfOutputs;
 extern uint16_t rxcVersion;
 uint8_t rxcConnect();
-
+uint16_t getChannel(uint8_t ch);
 uint8_t PSP_crc;
 
 #define AS_U8ARRAY(x) ((uint8_t *)(x))
@@ -180,8 +183,11 @@ void PSP_process_data(uint8_t code, uint16_t payload_length_received, uint8_t da
       rxtx_buf = spiReadData();
       if (rxtx_buf == 'F') {
         PSP_protocol_head(PSP_REQ_RX_FAILSAFE, 32);
-        for (uint8_t i = 0; i < 32; i++) {
-          PSP_serialize_uint8(spiReadData()); // failsafe data
+        for (uint8_t i = 0; i < 16; i++) {
+          // failsafe data
+          uint8_t tmp = spiReadData();
+          PSP_serialize_uint8(spiReadData());
+          PSP_serialize_uint8(tmp);
         }
       } else {
         PSP_protocol_head(PSP_REQ_RX_FAILSAFE, 1);
@@ -197,9 +203,9 @@ void PSP_process_data(uint8_t code, uint16_t payload_length_received, uint8_t da
     PSP_protocol_head(PSP_REQ_TX_CONFIG, sizeof(tx_config));
     {
       // Force correct TX type based on firmware
-#if (defined RFMXX_868)
+#if (RFMTYPE == 868)
       tx_config.rfm_type = 1;
-#elif (defined RFMXX_915)
+#elif (RFMTYPE == 915)
       tx_config.rfm_type = 2;
 #else
       tx_config.rfm_type = 0;
@@ -218,16 +224,21 @@ void PSP_process_data(uint8_t code, uint16_t payload_length_received, uint8_t da
   }
   break;
   case PSP_REQ_PPM_IN: {
-    PSP_protocol_head(PSP_REQ_PPM_IN, sizeof(PPM));
+    PSP_protocol_head(PSP_REQ_PPM_IN, 33);
 
-    cli();
-    for (uint8_t i = 0; i < sizeof(PPM); i++) {
-      PSP_serialize_uint8(AS_U8ARRAY(&PPM)[i]);
+    PSP_serialize_uint8((ppmAge < 255) ? ppmAge++ : ppmAge);
+    for (uint8_t i = 0; i < 16; i++) {
+      PSP_serialize_uint16(servoBits2Us(getChannel(i)));
     }
-    sei();
   }
   break;
-  // SET
+  case PSP_REQ_DEFAULT_PROFILE:
+    PSP_protocol_head(PSP_REQ_DEFAULT_PROFILE, 1);
+    {
+      PSP_serialize_uint8(defaultProfile);
+    }
+    break;
+    // SET
   case PSP_SET_BIND_DATA:
     PSP_protocol_head(PSP_SET_BIND_DATA, 1);
 
@@ -325,7 +336,7 @@ void PSP_process_data(uint8_t code, uint16_t payload_length_received, uint8_t da
   case PSP_SET_ACTIVE_PROFILE:
     PSP_protocol_head(PSP_SET_ACTIVE_PROFILE, 1);
 
-    profileSwap(data_buffer[0]);
+    activeProfile=data_buffer[0];
     txReadEeprom();
     PSP_serialize_uint8(0x01); // done
     break;
@@ -335,7 +346,10 @@ void PSP_process_data(uint8_t code, uint16_t payload_length_received, uint8_t da
       uint8_t rxtx_buf[33];
       if (payload_length_received == 32) {
         rxtx_buf[0] = 'g';
-        memcpy(rxtx_buf + 1, data_buffer, 32);
+        for (uint8_t i = 0; i < 32; i += 2) {
+          rxtx_buf[1 + i] = data_buffer[i + 1];
+          rxtx_buf[2 + i] = data_buffer[i];
+        }
         tx_packet(rxtx_buf, 33);
       } else {
         rxtx_buf[0] = 'G';
@@ -368,6 +382,12 @@ void PSP_process_data(uint8_t code, uint16_t payload_length_received, uint8_t da
     } else {
       PSP_serialize_uint8(0x00);
     }
+    break;
+  case PSP_SET_DEFAULT_PROFILE:
+    PSP_protocol_head(PSP_SET_DEFAULT_PROFILE, 1);
+
+    setDefaultProfile(data_buffer[0]);
+    PSP_serialize_uint8(0x01); // done
     break;
   case PSP_SET_EXIT:
     PSP_protocol_head(PSP_SET_EXIT, 1);
@@ -468,6 +488,18 @@ void PSP_read(void)
       payload_length_received = 0;
       state = 0;
       break;
+    }
+  }
+}
+
+void binaryMode()
+{
+  // Just entered binary mode, flip the bool
+  binary_mode_active = true;
+
+  while (binary_mode_active == true) { // LOCK user here until exit command is received
+    if (Serial.available()) {
+      PSP_read();
     }
   }
 }

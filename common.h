@@ -1,6 +1,7 @@
 //####### COMMON FUNCTIONS #########
 
 void rfmSetCarrierFrequency(uint32_t f);
+void rfmSetPower(uint8_t p);
 uint8_t rfmGetRSSI(void);
 void RF22B_init_parameter(void);
 uint8_t spiReadRegister(uint8_t address);
@@ -12,10 +13,21 @@ volatile uint16_t PPM[PPM_CHANNELS] = { 512, 512, 512, 512, 512, 512, 512, 512 ,
 
 const static uint8_t pktsizes[8] = { 0, 7, 11, 12, 16, 17, 21, 0 };
 
-
 uint8_t getPacketSize(struct bind_data *bd)
 {
-  return pktsizes[(bd->flags & 0x07)];
+  uint8_t r = pktsizes[(bd->flags & 0x07)];
+  if ((bd->flags & TELEMETRY_MASK) && (r < PACKETSIZE_TELEMETRY)) {
+    r = PACKETSIZE_TELEMETRY;
+  }
+  if (bd->flags & BIGPACKET) {
+    r = PACKETSIZE_BIG;
+  }
+  return r;
+}
+
+uint8_t getTelemetryPacketSize(struct bind_data *bd)
+{
+  return (bd->flags & BIGPACKET) ? PACKETSIZE_BIG : PACKETSIZE_TELEMETRY;
 }
 
 uint8_t getChannelCount(struct bind_data *bd)
@@ -28,12 +40,13 @@ uint32_t getInterval(struct bind_data *bd)
   uint32_t ret;
   // Sending a x byte packet on bps y takes about (emperical)
   // usec = (x + 15) * 8200000 / baudrate
-#define BYTES_AT_BAUD_TO_USEC(bytes, bps) ((uint32_t)((bytes) + 15) * 8200000L / (uint32_t)(bps))
+#define BYTES_AT_BAUD_TO_USEC(bytes, bps, div) ((uint32_t)((bytes) + (div?20:15)) * 8200000L / (uint32_t)(bps))
 
-  ret = (BYTES_AT_BAUD_TO_USEC(getPacketSize(bd), modem_params[bd->modem_params].bps) + 2000);
+  ret = (BYTES_AT_BAUD_TO_USEC(getPacketSize(bd), modem_params[bd->modem_params].bps, bd->flags & DIVERSITY_ENABLED) + 2000);
 
   if (bd->flags & TELEMETRY_MASK) {
-    ret += (BYTES_AT_BAUD_TO_USEC(TELEMETRY_PACKETSIZE, modem_params[bd->modem_params].bps) + 1000);
+    ret += (BYTES_AT_BAUD_TO_USEC(getTelemetryPacketSize(bd), modem_params[bd->modem_params].bps, bd->flags & DIVERSITY_ENABLED) + 1000);
+    ret += getTelemetryPacketSize(bd) * 70; // compensate for time needed on RFM data access
   }
 
   // round up to ms
@@ -97,23 +110,22 @@ void unpackChannels(uint8_t config, volatile uint16_t PPM[], uint8_t *p)
   }
 }
 
-// conversion between microseconds 800-2200 and value 0-1023
-// 808-1000 == 0 - 11     (16us per step)
-// 1000-1999 == 12 - 1011 ( 1us per step)
-// 2000-2192 == 1012-1023 (16us per step)
-
+// conversion between microseconds 800-2200 and value 1-1023
+// 820-1000  == 1 - 11    (17us per step)
+// 1000-2000 == 12 - 1012 ( 1us per step)
+// 2000-2180 == 1012-1023 (17us per step)
 uint16_t servoUs2Bits(uint16_t x)
 {
   uint16_t ret;
 
   if (x < 800) {
-    ret = 0;
+    ret = 1;
   } else if (x < 1000) {
-    ret = (x - 799) / 16;
-  } else if (x < 2000) {
+    ret = (x - 807) / 17 + 1;
+  } else if (x <= 2000) {
     ret = (x - 988);
-  } else if (x < 2200) {
-    ret = (x - 1992) / 16 + 1011;
+  } else if (x < 2192) {
+    ret = (x - 1990) / 17 + 1012;
   } else {
     ret = 1023;
   }
@@ -126,11 +138,11 @@ uint16_t servoBits2Us(uint16_t x)
   uint16_t ret;
 
   if (x < 12) {
-    ret = 808 + x * 16;
-  } else if (x < 1012) {
+    ret = 800 + x * 17;
+  } else if (x <= 1012) {
     ret = x + 988;
   } else if (x < 1024) {
-    ret = 2000 + (x - 1011) * 16;
+    ret = 1996 + (x - 1012) * 17;
   } else {
     ret = 2192;
   }
@@ -442,8 +454,20 @@ void rfmSetCarrierFrequency(uint32_t f)
   spiWriteRegister(0x77, (fc & 0xff));
 }
 
+void rfmSetPower(uint8_t p)
+{
+  spiWriteRegister(0x6d, p);
+}
+
 void init_rfm(uint8_t isbind)
 {
+#ifdef SDN_pin
+  digitalWrite(SDN_pin, 1);
+  delay(50);
+  digitalWrite(SDN_pin, 0);
+  delay(50);
+#endif
+
   ItStatus1 = spiReadRegister(0x03);   // read status, clear interrupt
   ItStatus2 = spiReadRegister(0x04);
   spiWriteRegister(0x06, 0x00);    // disable interrupts
@@ -457,7 +481,11 @@ void init_rfm(uint8_t isbind)
   spiWriteRegister(0x0b, 0x12);    // gpio0 TX State
   spiWriteRegister(0x0c, 0x15);    // gpio1 RX State
 #endif
-  spiWriteRegister(0x0d, 0xfd);    // gpio 2 micro-controller clk output
+#ifdef ANTENNA_DIVERSITY
+  spiWriteRegister(0x0d, (bind_data.flags & DIVERSITY_ENABLED)?0x17:0xfd); // gpio 2 ant. sw 1 if diversity on else VDD
+#else
+  spiWriteRegister(0x0d, 0xfd);    // gpio 2 VDD
+#endif
   spiWriteRegister(0x0e, 0x00);    // gpio    0, 1,2 NO OTHER FUNCTION.
 
   if (isbind) {
@@ -470,7 +498,7 @@ void init_rfm(uint8_t isbind)
   spiWriteRegister(0x30, 0x8c);    // enable packet handler, msb first, enable crc,
   spiWriteRegister(0x32, 0x0f);    // no broadcast, check header bytes 3,2,1,0
   spiWriteRegister(0x33, 0x42);    // 4 byte header, 2 byte synch, variable pkt size
-  spiWriteRegister(0x34, 0x0a);    // 10 nibbles (40 bit preamble)
+  spiWriteRegister(0x34, (bind_data.flags & DIVERSITY_ENABLED)?0x14:0x0a);    // 40 bit preamble, 80 with diversity
   spiWriteRegister(0x35, 0x2a);    // preath = 5 (20bits), rssioff = 2
   spiWriteRegister(0x36, 0x2d);    // synchronize word 3
   spiWriteRegister(0x37, 0xd4);    // synchronize word 2
@@ -516,12 +544,23 @@ void to_rx_mode(void)
   NOP();
 }
 
+static inline void clearFIFO()
+{
+  //clear FIFO, disable multipacket, enable diversity if needed
+#ifdef ANTENNA_DIVERSITY
+  spiWriteRegister(0x08, (bind_data.flags & DIVERSITY_ENABLED)?0x83:0x03);
+  spiWriteRegister(0x08, (bind_data.flags & DIVERSITY_ENABLED)?0x80:0x00);
+#else
+  spiWriteRegister(0x08, 0x03);
+  spiWriteRegister(0x08, 0x00);
+#endif
+}
+
 void rx_reset(void)
 {
   spiWriteRegister(0x07, RF22B_PWRSTATE_READY);
   spiWriteRegister(0x7e, 36);    // threshold for rx almost full, interrupt when 1 byte received
-  spiWriteRegister(0x08, 0x03);    //clear fifo disable multi packet
-  spiWriteRegister(0x08, 0x00);    // clear fifo, disable multi packet
+  clearFIFO();
   spiWriteRegister(0x07, RF22B_PWRSTATE_RX);   // to rx mode
   spiWriteRegister(0x05, RF22B_Rx_packet_received_interrupt);
   ItStatus1 = spiReadRegister(0x03);   //read the Interrupt Status1 register
@@ -563,14 +602,17 @@ void tx_packet(uint8_t* pkt, uint8_t size)
 
 uint8_t tx_done()
 {
-  if (RF_Mode != Transmit) {
+  if (RF_Mode == Transmitted) {
 #ifdef TX_TIMING
     Serial.print("TX took:");
     Serial.println(micros() - tx_start);
 #endif
+    RF_Mode = Available;
     return 1; // success
   }
-  if ((micros() - tx_start) > 100000) {
+  if ((RF_Mode == Transmit) && ((micros() - tx_start) > 100000)) {
+    spiWriteRegister(0x07, RF22B_PWRSTATE_READY);
+    RF_Mode = Available;
     return 2; // timeout
   }
   return 0;
@@ -594,7 +636,28 @@ void beacon_tone(int16_t hz, int16_t len) //duration is now in half seconds.
   }
 }
 
-void beacon_send(void)
+uint8_t beaconGetRSSI()
+{
+  uint16_t rssiSUM=0;
+  Green_LED_ON
+
+  rfmSetCarrierFrequency(rx_config.beacon_frequency);
+  spiWriteRegister(0x79, 0); // ch 0 to avoid offset
+  delay(1);
+  rssiSUM+=rfmGetRSSI();
+  delay(1);
+  rssiSUM+=rfmGetRSSI();
+  delay(1);
+  rssiSUM+=rfmGetRSSI();
+  delay(1);
+  rssiSUM+=rfmGetRSSI();
+
+  Green_LED_OFF
+
+  return rssiSUM>>2;
+}
+
+void beacon_send(bool static_tone)
 {
   Green_LED_ON
   ItStatus1 = spiReadRegister(0x03);   // read status, clear interrupt
@@ -630,34 +693,40 @@ void beacon_send(void)
   spiWriteRegister(0x07, RF22B_PWRSTATE_TX);    // to tx mode
   delay(10);
 
-  //close encounters tune
-  //  G, A, F, F(lower octave), C
-  //octave 3:  392  440  349  175   261
+  if (static_tone) {
+    uint8_t i=0;
+    while (i++<20) {
+      beacon_tone(440,1);
+      watchdogReset();
+    }
+  } else {
+    //close encounters tune
+    //  G, A, F, F(lower octave), C
+    //octave 3:  392  440  349  175   261
 
-  beacon_tone(392, 1);
-  watchdogReset();
+    beacon_tone(392, 1);
+    watchdogReset();
 
-  spiWriteRegister(0x6d, 0x05);   // 5 set mid power 25mW
-  delay(10);
-  beacon_tone(440,1);
-  watchdogReset();
+    spiWriteRegister(0x6d, 0x05);   // 5 set mid power 25mW
+    delay(10);
+    beacon_tone(440,1);
+    watchdogReset();
 
-  spiWriteRegister(0x6d, 0x04);   // 4 set mid power 13mW
-  delay(10);
-  beacon_tone(349, 1);
-  watchdogReset();
+    spiWriteRegister(0x6d, 0x04);   // 4 set mid power 13mW
+    delay(10);
+    beacon_tone(349, 1);
+    watchdogReset();
 
-  spiWriteRegister(0x6d, 0x02);   // 2 set min power 3mW
-  delay(10);
-  beacon_tone(175,1);
-  watchdogReset();
+    spiWriteRegister(0x6d, 0x02);   // 2 set min power 3mW
+    delay(10);
+    beacon_tone(175,1);
+    watchdogReset();
 
-  spiWriteRegister(0x6d, 0x00);   // 0 set min power 1.3mW
-  delay(10);
-  beacon_tone(261, 2);
-  watchdogReset();
-
-
+    spiWriteRegister(0x6d, 0x00);   // 0 set min power 1.3mW
+    delay(10);
+    beacon_tone(261, 2);
+    watchdogReset();
+  }
   spiWriteRegister(0x07, RF22B_PWRSTATE_READY);
   Green_LED_OFF
 }
@@ -674,4 +743,16 @@ void printVersion(uint16_t v)
   }
 }
 
-
+// Halt and blink failure code
+void fatalBlink(uint8_t blinks)
+{
+  while (1) {
+    for (uint8_t i=0; i < blinks; i++) {
+      Red_LED_ON;
+      delay(100);
+      Red_LED_OFF;
+      delay(100);
+    }
+    delay(300);
+  }
+}

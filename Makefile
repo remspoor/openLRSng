@@ -20,6 +20,8 @@ ARDUINO_PATH=/usr/share/arduino
 # 7 - PowerTowerRX
 #
 BOARD_TYPE=3
+BOARD_TYPES_TX=0 2 3 4 5 6 7 8 9
+BOARD_TYPES_RX=2 3 5 7 8 9
 
 #
 # You can compile all TX as TX, and all RX as either RX or TX.
@@ -46,21 +48,19 @@ CPU=atmega32u4
 USB_VID=0x2341
 USB_PID=0x8036
 VARIANT=leonardo
+BOOTLOADER=Caterina-Leonardo.hex
 else
 CPU=atmega328p
 USB_VID=null
 USB_PID=null
 VARIANT=standard
+BOOTLOADER=optiboot_atmega328.hex
 endif
 
 #
 # C preprocessor defines
 #
-ifeq ($(COMPILE_TX),1)
-DEFINES=-DBOARD_TYPE=$(BOARD_TYPE) -DCOMPILE_TX
-else
-DEFINES=-DBOARD_TYPE=$(BOARD_TYPE)
-endif
+DEFINES=-DBOARD_TYPE=$(BOARD_TYPE) -DCOMPILE_TX=$(COMPILE_TX) -DRFMTYPE=$(RFMTYPE)
 
 #
 # AVR GCC info
@@ -81,13 +81,20 @@ AR=$(EXEPATH)/$(EXEPREFIX)ar
 SIZE=$(EXEPATH)/$(EXEPREFIX)size
 OBJCOPY=$(EXEPATH)/$(EXEPREFIX)objcopy
 
+#
+# Shell commands
+#
 RM=rm
+MKDIR=mkdir
+LS=ls
+SED=sed
+CAT=cat
 
 #
 # Styling
 #
 ASTYLE=astyle
-ASTYLEOPTIONS=--style=1tbs --indent=spaces=2 --suffix=none
+ASTYLEOPTIONS=--options=none --style=1tbs --indent=spaces=2 --suffix=none --lineend=linux
 
 #
 # Compile flags
@@ -137,14 +144,20 @@ ARDUINO_LIBC_SRCS=malloc.c realloc.c
 INCLUDE=-I$(ARDUINO_CORELIB_PATH) -I$(ARDUINO_VARIANT_PATH) $(ARDUINO_LIB_INCL) -I.
 
 #
+# Project folders
+#
+LIBRARIES_FOLDER=libraries
+OUT_FOLDER=out
+
+#
 # Target object files
 #
-OBJS=openLRSng.o $(ARDUINO_LIB_OBJS) libraries/libcore.a
+OBJS=openLRSng.o $(ARDUINO_LIB_OBJS) $(LIBRARIES_FOLDER)/libcore.a
 
 #
 # Master target
 #
-all: openLRSng.hex
+all: mkdirs openLRSng.hex
 
 #
 # From here down are build rules
@@ -172,75 +185,50 @@ endef
 %.o: %.cpp
 	$(cxx-command)
 
-libraries/%.o: %.c
+$(LIBRARIES_FOLDER)/%.o: %.c
 	$(cc-command) 2>/dev/null
 
-libraries/%.o: %.cpp
+$(LIBRARIES_FOLDER)/%.o: %.cpp
 	$(cxx-command) 2>/dev/null
 
 #
 # Other targets
 #
-clean:
-	@$(RM) -f *.[aod] libraries/*.[aod] *.elf *.eep *.d *.hex
+clean: clean_compilation_products
+	@$(RM) -rf $(OUT_FOLDER)
+
+clean_compilation_products:
+	@$(RM) -rf $(LIBRARIES_FOLDER)
+	@$(RM) -f *.[aod] *.elf *.eep *.d *.hex
+
+mkdirs:
+	@$(MKDIR) -p $(LIBRARIES_FOLDER)
 
 openLRSng.hex: $(OBJS)
-	@$(CC) -Os -Wl,--gc-sections -mmcu=$(CPU) -o openLRSng.elf $(OBJS) -Llibraries -lm
+	@$(CC) -Os -Wl,--gc-sections -mmcu=$(CPU) -o openLRSng.elf $(OBJS) -L$(LIBRARIES_FOLDER) -lm
 	@$(OBJCOPY) -O ihex -j .eeprom --set-section-flags=.eeprom=alloc,load \
 		--no-change-warnings --change-section-lma .eeprom=0 \
 		openLRSng.elf openLRSng.eep
 	@$(OBJCOPY) -O ihex -R .eeprom openLRSng.elf openLRSng.hex
 	@echo "NOTE: Deployment size is text + data."
 	@$(SIZE) openLRSng.elf
+	@$(SED) "/:00000001FF/d" openLRSng.hex > openLRSngBL.hex
+	@$(CAT) bootloaders/$(BOOTLOADER) >> openLRSngBL.hex
 
-libraries/libcore.a: $(ARDUINO_CORELIB_OBJS)
-	@$(AR) rcs libraries/libcore.a $(ARDUINO_CORELIB_OBJS)
+$(LIBRARIES_FOLDER)/libcore.a: $(ARDUINO_CORELIB_OBJS)
+	@$(AR) rcs $(LIBRARIES_FOLDER)/libcore.a $(ARDUINO_CORELIB_OBJS)
 
 astyle:
 	$(ASTYLE) $(ASTYLEOPTIONS) openLRSng.ino *.h
 
-433:
-	mkdir -p out
-	rm -f out/*.hex
-	make -s COMPILE_TX= BOARD_TYPE=3 clean all && cp openLRSng.hex out/RX-3.hex
-	make -s COMPILE_TX= BOARD_TYPE=5 clean all && cp openLRSng.hex out/RX-5.hex
-	make -s COMPILE_TX= BOARD_TYPE=7 clean all && cp openLRSng.hex out/RX-7.hex
-	make -s COMPILE_TX=1 BOARD_TYPE=2 clean all && cp openLRSng.hex out/TX-2.hex
-	make -s COMPILE_TX=1 BOARD_TYPE=3 clean all && cp openLRSng.hex out/TX-3.hex
-	make -s COMPILE_TX=1 BOARD_TYPE=4 clean all && cp openLRSng.hex out/TX-4.hex
-	make -s COMPILE_TX=1 BOARD_TYPE=5 clean all && cp openLRSng.hex out/TX-5.hex
-	make -s COMPILE_TX=1 BOARD_TYPE=6 clean all && cp openLRSng.hex out/TX-6.hex
-	make -s COMPILE_TX=1 BOARD_TYPE=7 clean all && cp openLRSng.hex out/TX-7.hex
-	ls -l out
+433 868 915:
+	$(RM) -rf $(OUT_FOLDER)/$@
+	$(MKDIR) -p $(OUT_FOLDER)/$@
+	$(foreach type, $(BOARD_TYPES_RX), make -s RFMTYPE=$@ COMPILE_TX=0 BOARD_TYPE=$(type) clean_compilation_products all && cp openLRSng.hex $(OUT_FOLDER)/$@/RX-$(type).hex && cp openLRSngBL.hex $(OUT_FOLDER)/$@/RX-$(type)-bl.hex;)
+	$(foreach type, $(BOARD_TYPES_TX), make -s RFMTYPE=$@ COMPILE_TX=1 BOARD_TYPE=$(type) clean_compilation_products all && cp openLRSng.hex $(OUT_FOLDER)/$@/TX-$(type).hex && cp openLRSngBL.hex $(OUT_FOLDER)/$@/TX-$(type)-bl.hex;)
+	make -s RFMTYPE=$@ COMPILE_TX=0 BOARD_TYPE=8 CLOCK=8000000 clean_compilation_products all && cp openLRSng.hex $(OUT_FOLDER)/$@/RX-8-8MHz.hex && cp openLRSngBL.hex $(OUT_FOLDER)/$@/RX-8-8MHz-bl.hex
+	$(LS) -l $(OUT_FOLDER)
 
-868:
-	mkdir -p out/868
-	rm -f out/868/*.hex
-	make -s RFMXX_868=1 COMPILE_TX= BOARD_TYPE=3 clean all && cp openLRSng.hex out/868/RX-3.hex
-	make -s RFMXX_868=1 COMPILE_TX= BOARD_TYPE=5 clean all && cp openLRSng.hex out/868/RX-5.hex
-	make -s RFMXX_868=1 COMPILE_TX= BOARD_TYPE=7 clean all && cp openLRSng.hex out/868/RX-7.hex
-	make -s RFMXX_868=1 COMPILE_TX=1 BOARD_TYPE=2 clean all && cp openLRSng.hex out/868/TX-2.hex
-	make -s RFMXX_868=1 COMPILE_TX=1 BOARD_TYPE=3 clean all && cp openLRSng.hex out/868/TX-3.hex
-	make -s RFMXX_868=1 COMPILE_TX=1 BOARD_TYPE=4 clean all && cp openLRSng.hex out/868/TX-4.hex
-	make -s RFMXX_868=1 COMPILE_TX=1 BOARD_TYPE=5 clean all && cp openLRSng.hex out/868/TX-5.hex
-	make -s RFMXX_868=1 COMPILE_TX=1 BOARD_TYPE=6 clean all && cp openLRSng.hex out/868/TX-6.hex
-	make -s RFMXX_868=1 COMPILE_TX=1 BOARD_TYPE=7 clean all && cp openLRSng.hex out/868/TX-7.hex
-	ls -l out/868
-
-915:
-	mkdir -p out/915
-	rm -f out/915/*.hex
-	make -s RFMXX_915=1 COMPILE_TX= BOARD_TYPE=3 clean all && cp openLRSng.hex out/915/RX-3.hex
-	make -s RFMXX_915=1 COMPILE_TX= BOARD_TYPE=5 clean all && cp openLRSng.hex out/915/RX-5.hex
-	make -s RFMXX_915=1 COMPILE_TX= BOARD_TYPE=7 clean all && cp openLRSng.hex out/915/RX-7.hex
-	make -s RFMXX_915=1 COMPILE_TX=1 BOARD_TYPE=2 clean all && cp openLRSng.hex out/915/TX-2.hex
-	make -s RFMXX_915=1 COMPILE_TX=1 BOARD_TYPE=3 clean all && cp openLRSng.hex out/915/TX-3.hex
-	make -s RFMXX_915=1 COMPILE_TX=1 BOARD_TYPE=4 clean all && cp openLRSng.hex out/915/TX-4.hex
-	make -s RFMXX_915=1 COMPILE_TX=1 BOARD_TYPE=5 clean all && cp openLRSng.hex out/915/TX-5.hex
-	make -s RFMXX_915=1 COMPILE_TX=1 BOARD_TYPE=6 clean all && cp openLRSng.hex out/915/TX-6.hex
-	make -s RFMXX_915=1 COMPILE_TX=1 BOARD_TYPE=7 clean all && cp openLRSng.hex out/915/TX-7.hex
-	ls -l out/868
-
-allfw:  433 868 915
-	ls -lR out
+allfw: 433 868 915
+	$(LS) -lR $(OUT_FOLDER)
 

@@ -3,6 +3,9 @@
  ****************************************************/
 uint8_t RF_channel = 0;
 
+uint8_t altPwrIndex = 0; // every nth packet at lower power
+uint8_t altPwrCount = 0;
+
 uint8_t FSstate = 0; // 1 = waiting timer, 2 = send FS, 3 sent waiting btn release
 uint32_t FStime = 0;  // time when button went down...
 
@@ -68,12 +71,20 @@ static inline void processPulse(uint16_t pulse)
     return;
   }
 
+#if (F_CPU == 16000000)
   if (!(tx_config.flags & MICROPPM)) {
     pulse >>= 1; // divide by 2 to get servo value on normal PPM
   }
+#elif (F_CPU == 8000000)
+  if (tx_config.flags & MICROPPM) {
+    pulse<<= 1; //  multiply microppm value by 2
+  }
+#else
+#error F_CPU invalid
+#endif
 
   if (pulse > 2500) {      // Verify if this is the sync pulse (2.5ms)
-    if ((ppmCounter>5) && (ppmCounter!=255)) {
+    if ((ppmCounter>(TX_CONFIG_GETMINCH()?TX_CONFIG_GETMINCH():1)) && (ppmCounter!=255)) {
       uint8_t i;
       for (i=0; i < ppmCounter; i++) {
         PPM[i] = ppmWork.words[i];
@@ -182,8 +193,12 @@ void bindMode(void)
 #ifdef CLI
       case '\n':
       case '\r':
+#ifdef CLI_ENABLED
         Serial.println(F("Enter menu..."));
         handleCLI();
+#else
+        Serial.println(F("CLI not available, use configurator!"));
+#endif
         break;
 #endif
       case '#':
@@ -200,6 +215,33 @@ void bindMode(void)
       Red_LED_OFF;
       Green_LED_OFF;
     }
+  }
+}
+
+void setupProfile()
+{
+  profileInit();
+  if (activeProfile==TX_PROFILE_COUNT) {
+#if defined(TX_MODE2)
+    switch ((digitalRead(TX_MODE1)?1:0) | (digitalRead(TX_MODE2)?2:0)) {
+    case 2:
+      activeProfile = 0; // MODE1 grounded
+      break;
+    case 1:
+      activeProfile = 1; // MODE2 grounded
+      break;
+    case 3:
+      activeProfile = 2; // both high
+      break;
+    case 0:
+      activeProfile = 3; // both ground
+      break;
+    }
+#elif defined(TX_MODE1)
+    activeProfile = digitalRead(TX_MODE1) ? 0 : 1;
+#else
+    activeProfile = 0;
+#endif
   }
 }
 
@@ -243,11 +285,14 @@ void checkButton(void)
 
       buzzerOff();
       if (swapProfile) {
-        profileSwap((activeProfile + 1) % TX_PROFILE_COUNT);
+        setDefaultProfile((defaultProfile + 1) % (TX_PROFILE_COUNT+1));
+        setupProfile();
         txReadEeprom();
+        delay(500);
         return;
       }
-      bindRandomize();
+      bindRandomize(false);
+      chooseChannelsPerRSSI();
       txWriteEeprom();
     }
 just_bind:
@@ -300,12 +345,12 @@ static inline void checkFS(void)
   }
 }
 
-uint8_t tx_buf[21];
-uint8_t rx_buf[9];
+uint8_t tx_buf[PACKETSIZE_BIG];
+uint8_t rx_buf[PACKETSIZE_BIG];
 
 #define SERIAL_BUFSIZE 32
 uint8_t serial_buffer[SERIAL_BUFSIZE];
-uint8_t serial_resend[9];
+uint8_t serial_resend[PACKETSIZE_BIG];
 uint8_t serial_head;
 uint8_t serial_tail;
 uint8_t serial_okToSend; // 2 if it is ok to send serial instead of servo
@@ -328,7 +373,15 @@ void setup(void)
   pinMode(Red_LED2, OUTPUT); //RED LED
   pinMode(Green_LED2, OUTPUT); //GREEN LED
 #endif
-  pinMode(BTN, INPUT); //Buton
+  pinMode(BTN, INPUT); //Button
+#ifdef TX_MODE1
+  pinMode(TX_MODE1, INPUT);
+  digitalWrite(TX_MODE1, HIGH);
+#endif
+#ifdef TX_MODE2
+  pinMode(TX_MODE2, INPUT);
+  digitalWrite(TX_MODE2, HIGH);
+#endif
   pinMode(PPM_IN, INPUT); //PPM from TX
   digitalWrite(PPM_IN, HIGH); // enable pullup for TX:s with open collector output
 #if defined (RF_OUT_INDICATOR)
@@ -342,7 +395,7 @@ void setup(void)
 #else
   Serial.begin(115200);
 #endif
-  profileInit();
+  setupProfile();
   txReadEeprom();
 
   setupPPMinput();
@@ -386,6 +439,15 @@ void setup(void)
 
   setupPPMinput(); // need to do this to make sure ppm polarity is correct if profile was changed
 
+  altPwrIndex=0;
+  if(tx_config.flags & ALT_POWER) {
+    if (bind_data.hopchannel[6] && bind_data.hopchannel[13] && bind_data.hopchannel[20]) {
+      altPwrIndex=7;
+    } else {
+      altPwrIndex=5;
+    }
+  }
+
   init_rfm(0);
   rfmSetChannel(RF_channel);
   rx_reset();
@@ -412,11 +474,11 @@ void setup(void)
 uint8_t compositeRSSI(uint8_t rssi, uint8_t linkq)
 {
   if (linkq >= 15) {
-    // RSSI 0 - 255 mapped to 192 - ((255>>2)+192) == 192-255
-    return (rssi >> 2) + 192;
+    // RSSI 0 - 255 mapped to 128 - ((255>>2)+192) == 128-255
+    return (rssi >> 1) + 128;
   } else {
-    // linkquality gives 0 to 14*13 == 182
-    return linkq * 13;
+    // linkquality gives 0 to 14*0 == 126
+    return linkq * 9;
   }
 }
 
@@ -449,7 +511,7 @@ static inline void processSpektrum(uint8_t c)
           ch = ppmWork.words[i] >> 11;
           v = (ppmWork.words[i] & 0x7ff)>>1;
         }
-        if (ch<16) {
+        if (ch < 16) {
           PPM[ch] = v;
         }
 #ifdef DEBUG_DUMP_PPM
@@ -555,6 +617,72 @@ void processChannelsFromSerial(uint8_t c)
   }
 }
 
+uint16_t getChannel(uint8_t ch)
+{
+  uint16_t v=512;
+  ch = tx_config.chmap[ch];
+  if (ch < 16) {
+    cli();  // disable interrupts when copying servo positions, to avoid race on 2 byte variable written by ISR
+    v = PPM[ch];
+    sei();
+  } else if ((ch > 0xf1) && (ch < 0xfd)) {
+    v = 12 + (ch - 0xf2) * 100;
+  } else {
+    switch (ch) {
+#ifdef TX_AIN0
+#ifdef TX_AIN_IS_DIGITAL
+    case 16:
+      v = digitalRead(TX_AIN0) ? 1012 : 12;
+      break;
+    case 17:
+      v = digitalRead(TX_AIN1) ? 1012 : 12;
+      break;
+#else
+    case 16:
+      v = analogRead(TX_AIN0);
+      break;
+    case 17:
+      v = analogRead(TX_AIN1);
+      break;
+#endif
+#endif
+    case 18: // mode switch
+#if defined(TX_MODE2)
+      switch ((digitalRead(TX_MODE1)?1:0) | (digitalRead(TX_MODE2)?2:0)) {
+      case 2:
+        v = 12;
+        break;
+      case 1:
+        v =  1012;
+        break;
+      case 3:
+        v =  345;
+        break;
+      case 0:
+        v = 678;
+        break;
+      }
+#elif defined(TX_MODE1)
+      v = (digitalRead(TX_MODE1) ? 12 : 1012);
+#endif
+      break;
+    case 0xf0:
+      v = 0;
+      break;
+    case 0xf1:
+      v = 6;
+      break;
+    case 0xfd:
+      v = 1018;
+      break;
+    case 0xfe:
+      v = 1023;
+      break;
+    }
+  }
+  return v;
+}
+
 void loop(void)
 {
 #ifdef DEBUG_DUMP_PPM
@@ -607,16 +735,16 @@ void loop(void)
     linkQuality |= 1;
     RF_Mode = Receive;
     spiSendAddress(0x7f); // Send the package read command
-    for (int16_t i = 0; i < 9; i++) {
+    for (int16_t i = 0; i < getTelemetryPacketSize(&bind_data); i++) {
       rx_buf[i] = spiReadData();
     }
 
     if ((tx_buf[0] ^ rx_buf[0]) & 0x40) {
       tx_buf[0] ^= 0x40; // swap sequence to ack
-      if ((rx_buf[0] & 0x38) == 0x38) {
+      if (rx_buf[0] & 0x20) {
         uint8_t i;
         // transparent serial data...
-        for (i = 0; i<= (rx_buf[0] & 7);) {
+        for (i = 0; i<= (rx_buf[0] & 31);) {
           i++;
           if (bind_data.flags & TELEMETRY_FRSKY) {
             frskyUserData(rx_buf[i]);
@@ -661,7 +789,7 @@ void loop(void)
     while (PPM[2] > 1013);
 #endif
 
-    if (ppmAge < 8) {
+    if ((ppmAge < 8) || (!TX_CONFIG_GETMINCH())) {
       ppmAge++;
 
       if (lastTelemetry) {
@@ -682,17 +810,15 @@ void loop(void)
       if ((serial_tail != serial_head) && (serial_okToSend == 2)) {
         tx_buf[0] ^= 0x80; // signal new data on line
         uint8_t bytes = 0;
-        uint8_t maxbytes = 8;
-        if (getPacketSize(&bind_data) < 9) {
-          maxbytes = getPacketSize(&bind_data) - 1;
-        }
+        uint8_t maxbytes = getPacketSize(&bind_data) -1;
+
         while ((bytes < maxbytes) && (serial_head != serial_tail)) {
           bytes++;
           tx_buf[bytes] = serial_buffer[serial_head];
           serial_resend[bytes] = serial_buffer[serial_head];
           serial_head = (serial_head + 1) % SERIAL_BUFSIZE;
         }
-        tx_buf[0] |= (0x37 + bytes);
+        tx_buf[0] |= (0x1f + bytes);
         serial_resend[0] = bytes;
         serial_okToSend = 3; // sent but not acked
       } else if (serial_okToSend == 4) {
@@ -700,9 +826,10 @@ void loop(void)
         for (i = 0; i < serial_resend[0]; i++) {
           tx_buf[i + 1] = serial_resend[i + 1];
         }
-        tx_buf[0] |= (0x37 + serial_resend[0]);
+        tx_buf[0] |= (0x1f + serial_resend[0]);
         serial_okToSend = 3; // sent but not acked
       } else {
+        uint16_t PPMout[16];
         if (FSstate == 2) {
           tx_buf[0] |= 0x01; // save failsafe
           Red_LED_ON
@@ -716,18 +843,42 @@ void loop(void)
             serial_okToSend = 4;  // resend
           }
         }
-        cli(); // disable interrupts when copying servo positions, to avoid race on 2 byte variable
-        packChannels(bind_data.flags & 7, PPM, tx_buf + 1);
-        sei();
+        for (uint8_t i=0; i < 16; i++) {
+          PPMout[i] = getChannel(i);
+        }
+        packChannels(bind_data.flags & 7, PPMout, tx_buf + 1);
       }
       //Green LED will be on during transmission
       Green_LED_ON;
 
+      {
+        uint8_t power = bind_data.rf_power;
+        if (altPwrIndex && power && (altPwrCount++ == altPwrIndex)) {
+          altPwrCount=0;
+          power--;
+        }
+#ifdef TX_MODE1
+        if (tx_config.flags & SW_POWER) {
+          if (!digitalRead(TX_MODE1)) {
+            Red_LED_ON;
+            power=7;
+          }
+        }
+#endif
+        rfmSetPower(power);
+      }
+
       // Send the data over RF
       rfmSetChannel(RF_channel);
-
       tx_packet_async(tx_buf, getPacketSize(&bind_data));
 
+#ifdef TX_MODE1
+      if (tx_config.flags & SW_POWER) {
+        if (!digitalRead(TX_MODE1)) {
+          Red_LED_OFF;
+        }
+      }
+#endif
       //Hop to the next frequency
       RF_channel++;
 
@@ -737,21 +888,23 @@ void loop(void)
 
     } else {
       if (ppmAge == 8) {
-        Red_LED_ON
+        Red_LED_ON;
       }
       ppmAge = 9;
       // PPM data outdated - do not send packets
     }
   }
 
-  if ((bind_data.flags & TELEMETRY_MASK) && (RF_Mode == Transmitted)) {
-    linkQuality <<= 1;
-    RF_Mode = Receive;
-    rx_reset();
-    // tell loop to sample downlink RSSI
-    sampleRSSI = micros();
-    if (sampleRSSI == 0) {
-      sampleRSSI = 1;
+  if (tx_done() == 1) {
+    if (bind_data.flags & TELEMETRY_MASK) {
+      linkQuality <<= 1;
+      RF_Mode = Receive;
+      rx_reset();
+      // tell loop to sample downlink RSSI
+      sampleRSSI = micros();
+      if (sampleRSSI == 0) {
+        sampleRSSI = 1;
+      }
     }
   }
 

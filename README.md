@@ -17,6 +17,9 @@ CONFIGURATOR UTILITY / BINARY FIRMWARE NOTE:
 
 TRANSMITTER HW:
 ===============
+  - TX_BOARD_TYPE 0 (Arduino Mini/nano 328 16MHz)
+    - Flytron openLRS M1 (100mW) TX
+
   - TX_BOARD_TYPE 2 (Arduino Mini/nano 328 16MHz)
     - Flytron openLRS M2 (100mW)/M3(1W) TX
     - OrangeRX UHF TX unit
@@ -40,8 +43,16 @@ TRANSMITTER HW:
   - TX_BOARD_TYPE 6 (Arduino Leonardo)
     - DTFUHF/HawkEye deluxe TX
 
+  - TX_BOARD_TYPE 7 (RX as TX)
+    - Brotronics PowerTowerRX
+
+  - RX_BOARD_TYPE 8 (RX as TX)
+    - openLRSng microRX
+
 RECEIVER HW:
 ============
+  - RX_BOARD_TYPE 2 (TX module as RX) (328P 16MHz)
+
   - RX_BOARD_TYPE 3 (Arduino Mini/nano 328 16MHz)
     - Flytron openLRS RX
     - OrangeRX UHF RX (NOTE both LEDs are RED!!)
@@ -49,6 +60,12 @@ RECEIVER HW:
 
   - RX_BOARD_TYPE 5 (Arduino Mini/nano 328 16MHz)
     - DTFUHF/HawkEye 4ch/6ch RX
+
+  - RX_BOARD_TYPE 7
+    - Brotronics PowerTowerRX
+
+  - RX_BOARD_TYPE 8
+    - openLRSng microRX
 
   Receiver pin functiontions are mapped using the configurator or CLI interface.
 
@@ -75,6 +92,14 @@ Use a 3v3 FTDI (or other USB to TTL serial adapter) and Arduino >= 1.0.
 
   o for deluxeTX "arduino boardtype" must be set to "Leonardo"
 
+
+GENERATED FIRMWARE FILES:
+=========================
+Makefile generates TX/RX firmware files for each frequency 433/868/915 as well as all hardware types [RX/TX]-[#].hex.
+
+The "*-bl.hex" files contain bootloader and can be used when flashing via ICSP.
+  o 328p model (all but type 6) use optiboot bootloader and thus needs fuses set to: Low: FF High: DE Ext: 05.
+  o type 6 uses 'caterina' and fuses should be set to: Low: FF High: D8 Ext: CB.
 
 USERS GUIDE
 ===========

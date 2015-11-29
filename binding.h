@@ -13,7 +13,6 @@
 // 0 == 1.3mW
 #define DEFAULT_RF_POWER 7
 
-#define DEFAULT_CARRIER_FREQUENCY 435000000  // Hz  startup frequency
 #define DEFAULT_CHANNEL_SPACING 5 // 50kHz
 #define DEFAULT_HOPLIST 22,10,19,34,49,41
 #define DEFAULT_RF_MAGIC 0xDEADFEED
@@ -26,6 +25,8 @@
 #define DEFAULT_BAUDRATE 115200
 
 // TX_CONFIG flag masks
+#define SW_POWER            0x04 // enable powertoggle via switch (JR dTX)
+#define ALT_POWER           0x08
 #define MUTE_TX             0x10 // do not beep on telemetry loss
 #define MICROPPM            0x20
 #define INVERTED_PPMIN      0x40
@@ -36,6 +37,7 @@
 #define ALWAYS_BIND         0x02
 #define SLAVE_MODE          0x04
 #define IMMEDIATE_OUTPUT    0x08
+#define STATIC_BEACON       0x10
 #define WATCHDOG_USED       0x80 // read only flag, only sent to configurator
 
 // BIND_DATA flag masks
@@ -50,8 +52,9 @@
 #define CHANNELS_12         0x04
 #define CHANNELS_12_4       0x05
 #define CHANNELS_16         0x06
+#define BIGPACKET           0x20 // use 33 byte packets for more telemetry...
+#define DIVERSITY_ENABLED   0x80
 #define DEFAULT_FLAGS       (CHANNELS_8 | TELEMETRY_PASSTHRU)
-
 
 // helper macro for European PMR channels
 #define EU_PMR_CH(x) (445993750L + 12500L * (x)) // valid for ch1-ch8
@@ -71,7 +74,8 @@
 
 #define BINDING_POWER     0x06 // not lowest since may result fail with RFM23BP
 
-#define TELEMETRY_PACKETSIZE 9
+#define PACKETSIZE_TELEMETRY 17
+#define PACKETSIZE_BIG       33
 
 #define BIND_MAGIC (0xDEC1BE15 + (OPENLRSNG_VERSION & 0xfff0))
 #define BINDING_VERSION ((OPENLRSNG_VERSION & 0x0ff0)>>4)
@@ -79,12 +83,12 @@
 static uint8_t default_hop_list[] = {DEFAULT_HOPLIST};
 
 // HW frequency limits
-#if (defined RFMXX_868)
+#if (RFMTYPE == 868)
 #  define MIN_RFM_FREQUENCY 848000000
 #  define MAX_RFM_FREQUENCY 888000000
 #  define DEFAULT_CARRIER_FREQUENCY 868000000  // Hz  (ch 0)
 #  define BINDING_FREQUENCY 868000000 // Hz
-#elif (defined RFMXX_915)
+#elif (RFMTYPE == 915)
 #  define MIN_RFM_FREQUENCY 895000000
 #  define MAX_RFM_FREQUENCY 935000000
 #  define DEFAULT_CARRIER_FREQUENCY 915000000  // Hz  (ch 0)
@@ -100,18 +104,24 @@ static uint8_t default_hop_list[] = {DEFAULT_HOPLIST};
 #define PPM_CHANNELS 16
 
 uint8_t activeProfile = 0;
+uint8_t defaultProfile = 0;
 
 struct tx_config {
   uint8_t  rfm_type;
   uint32_t max_frequency;
   uint32_t flags;
+  uint8_t  chmap[16];
 } tx_config;
+
+// 0 - no PPM needed, 1=2ch ... 0x0f=16ch
+#define TX_CONFIG_GETMINCH() (tx_config.flags >> 28)
+#define TX_CONFIG_SETMINCH(x) (tx_config.flags = (tx_config.flags & 0x0fffffff) | (((uint32_t)(x) & 0x0f) << 28))
 
 struct RX_config {
   uint8_t  rx_type; // RX type fillled in by RX, do not change
   uint8_t  pinMapping[13];
   uint8_t  flags;
-  uint8_t  RSSIpwm;
+  uint8_t  RSSIpwm; //0-15 inject composite, 16-31 inject quality, 32-47 inject RSSI, 48-63 inject quality & RSSI on two separate channels
   uint32_t beacon_frequency;
   uint8_t  beacon_deadtime;
   uint8_t  beacon_interval;
@@ -187,28 +197,14 @@ void CRC16_add(uint8_t c) // CCITT polynome
   }
 }
 
-// Halt and blink failure code
-void fatalBlink(uint8_t blinks)
-{
-  while (1) {
-    for (uint8_t i=0; i < blinks; i++) {
-      Red_LED_ON;
-      delay(100);
-      Red_LED_OFF;
-      delay(100);
-    }
-    delay(300);
-  }
-}
-
-#ifndef COMPILE_TX
+#if (COMPILE_TX != 1)
 extern uint16_t failsafePPM[PPM_CHANNELS];
 #endif
 
 #define EEPROM_SIZE 1024 // EEPROM is 1k on 328p and 32u4
 #define ROUNDUP(x) (((x)+15)&0xfff0)
 #define MIN256(x)  (((x)<256)?256:(x))
-#ifdef COMPILE_TX
+#if (COMPILE_TX == 1)
 #define EEPROM_DATASIZE MIN256(ROUNDUP((sizeof(tx_config) + sizeof(bind_data) + 4) * 4 + 3))
 #else
 #define EEPROM_DATASIZE MIN256(ROUNDUP(sizeof(rx_config) + sizeof(bind_data) + sizeof(failsafePPM) + 6))
@@ -226,7 +222,7 @@ bool accessEEPROM(uint8_t dataType, bool write)
 
   do {
 start:
-#ifdef COMPILE_TX
+#if (COMPILE_TX == 1)
     if (dataType == 0) {
       dataAddress = &tx_config;
       dataSize = sizeof(tx_config);
@@ -237,9 +233,9 @@ start:
       addressNeedle = sizeof(tx_config) + 2;
       addressNeedle += (sizeof(tx_config) + sizeof(bind_data) + 4) * activeProfile;
     } else if (dataType == 2) {
-      dataAddress = &activeProfile;
+      dataAddress = &defaultProfile;
       dataSize = 1;
-      addressNeedle = (sizeof(tx_config) + sizeof(bind_data) + 4) * 4; // activeProfile is stored behind all 4 profiles
+      addressNeedle = (sizeof(tx_config) + sizeof(bind_data) + 4) * 4; // defaultProfile is stored behind all 4 profiles
     }
 #else
     if (dataType == 0) {
@@ -321,8 +317,8 @@ void bindInitDefaults(void)
   bind_data.flags = DEFAULT_FLAGS;
 }
 
-#ifdef COMPILE_TX
-#define TX_PROFILE_COUNT 4
+#if (COMPILE_TX == 1)
+#define TX_PROFILE_COUNT  4
 
 void profileSet()
 {
@@ -332,43 +328,30 @@ void profileSet()
 void profileInit()
 {
   accessEEPROM(2, false);
-  if (activeProfile >= TX_PROFILE_COUNT) {
-    activeProfile = 0;
+  if (defaultProfile > TX_PROFILE_COUNT) {
+    defaultProfile = 0;
     profileSet();
   }
+  activeProfile = defaultProfile;
 }
 
-void profileSwap(uint8_t profile)
+void setDefaultProfile(uint8_t profile)
 {
-  profileInit();
-  if ((activeProfile != profile) && (profile < TX_PROFILE_COUNT)) {
-    activeProfile = profile;
-    profileSet();
-  }
+  defaultProfile = profile;
+  profileSet();
 }
 
 void txInitDefaults()
 {
   tx_config.max_frequency = MAX_RFM_FREQUENCY;
   tx_config.flags = 0x00;
-}
-
-void txWriteEeprom()
-{
-  accessEEPROM(0,true);
-  accessEEPROM(1,true);
-}
-
-void txReadEeprom()
-{
-  if ((!accessEEPROM(0, false)) || (!accessEEPROM(1, false))) {
-    txInitDefaults();
-    bindInitDefaults();
-    txWriteEeprom();
+  TX_CONFIG_SETMINCH(5); // 6ch
+  for (uint8_t i = 0; i < 16; i++) {
+    tx_config.chmap[i] = i;
   }
 }
 
-void bindRandomize(void)
+void bindRandomize(bool randomChannels)
 {
   uint8_t emergency_counter = 0;
   uint8_t c;
@@ -383,30 +366,48 @@ void bindRandomize(void)
     bind_data.rf_magic = (bind_data.rf_magic << 8) + (random() % 255);
   }
 
-  // TODO: verify if this works properly
-  for (c = 0; (c < MAXHOPS) && (bind_data.hopchannel[c] != 0); c++) {
+  if (randomChannels) {
+    // TODO: verify if this works properly
+    for (c = 0; (c < MAXHOPS) && (bind_data.hopchannel[c] != 0); c++) {
 again:
-    if (emergency_counter++ == 255) {
-      bindInitDefaults();
-      return;
-    }
+      if (emergency_counter++ == 255) {
+        bindInitDefaults();
+        return;
+      }
 
-    uint8_t ch = (random() % 50) + 1;
+      uint8_t ch = (random() % 50) + 1;
 
-    // don't allow same channel twice
-    for (uint8_t i = 0; i < c; i++) {
-      if (bind_data.hopchannel[i] == ch) {
+      // don't allow same channel twice
+      for (uint8_t i = 0; i < c; i++) {
+        if (bind_data.hopchannel[i] == ch) {
+          goto again;
+        }
+      }
+
+      // don't allow frequencies higher then tx_config.max_frequency
+      uint32_t real_frequency = bind_data.rf_frequency + (uint32_t)ch * (uint32_t)bind_data.rf_channel_spacing * 10000UL;
+      if (real_frequency > tx_config.max_frequency) {
         goto again;
       }
-    }
 
-    // don't allow frequencies higher then tx_config.max_frequency
-    uint32_t real_frequency = bind_data.rf_frequency + ch * bind_data.rf_channel_spacing * 10000;
-    if (real_frequency > tx_config.max_frequency) {
-      goto again;
+      bind_data.hopchannel[c] = ch;
     }
+  }
+}
 
-    bind_data.hopchannel[c] = ch;
+void txWriteEeprom()
+{
+  accessEEPROM(0,true);
+  accessEEPROM(1,true);
+}
+
+void txReadEeprom()
+{
+  if ((!accessEEPROM(0, false)) || (!accessEEPROM(1, false)) || (bind_data.version != BINDING_VERSION)) {
+    txInitDefaults();
+    bindInitDefaults();
+    bindRandomize(true);
+    txWriteEeprom();
   }
 }
 #endif
@@ -441,7 +442,7 @@ uint32_t delayInMsLong(uint8_t d)
   return delayInMs((uint16_t)d + 100);
 }
 
-#ifndef COMPILE_TX
+#if (COMPILE_TX != 1)
 // following is only needed on receiver
 void failsafeSave(void)
 {
@@ -451,47 +452,18 @@ void failsafeSave(void)
 void failsafeLoad(void)
 {
   if (!accessEEPROM(2, false)) {
-    failsafePPM[0]=0xffff;
+    for (uint8_t i = 0; i < 16; i++) {
+      failsafePPM[i]=0;
+    }
   }
 }
 
+void rxInitHWConfig();
+
 void rxInitDefaults(bool save)
 {
-#if (BOARD_TYPE == 3)
-  uint8_t i;
-  rx_config.rx_type = RX_FLYTRON8CH;
-  rx_config.pinMapping[0] = PINMAP_RSSI; // the CH0 on 8ch RX
-  for (i = 1; i < 9; i++) {
-    rx_config.pinMapping[i] = i - 1; // default to PWM out
-  }
-  rx_config.pinMapping[9] = PINMAP_ANALOG;
-  rx_config.pinMapping[10] = PINMAP_ANALOG;
-  rx_config.pinMapping[11] = PINMAP_RXD;
-  rx_config.pinMapping[12] = PINMAP_TXD;
-#elif (BOARD_TYPE == 5)
-  uint8_t i;
-  rx_config.rx_type = RX_OLRSNG4CH;
-  for (i = 0; i < 4; i++) {
-    rx_config.pinMapping[i] = i; // default to PWM out
-  }
-  rx_config.pinMapping[4] = 4;
-  rx_config.pinMapping[5] = 5;
-  rx_config.pinMapping[6] = PINMAP_RXD;
-  rx_config.pinMapping[7] = PINMAP_TXD;
-#elif (BOARD_TYPE == 7)
-  rx_config.rx_type = RX_PTOWER;
-  rx_config.pinMapping[0] = PINMAP_PPM;
-  rx_config.pinMapping[1] = PINMAP_SDA;
-  rx_config.pinMapping[2] = PINMAP_RSSI;
-  rx_config.pinMapping[3] = PINMAP_SCL;
-  // Skipping pinMapping[4] as it is NC
-  rx_config.pinMapping[5] = PINMAP_LLIND;
-  rx_config.pinMapping[6] = PINMAP_RXD;
-  rx_config.pinMapping[7] = PINMAP_TXD;
 
-#else
-#error INVALID RX BOARD
-#endif
+  rxInitHWConfig();
 
   rx_config.flags = ALWAYS_BIND;
   rx_config.RSSIpwm = 255; // off
@@ -505,7 +477,9 @@ void rxInitDefaults(bool save)
 
   if (save) {
     accessEEPROM(0, true);
-    failsafePPM[0] = 0xffff;
+    for (uint8_t i = 0; i < 16; i++) {
+      failsafePPM[i]=0;
+    }
     failsafeSave();
   }
 }

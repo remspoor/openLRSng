@@ -44,7 +44,8 @@
 
 //####### COMPILATION TARGET #######
 // Enable to compile transmitter code, default is RX (remove leading //)
-//#define COMPILE_TX
+//#define COMPILE_TX 0 // compile RX code
+//#define COMPILE_TX 1 // compile TX code
 
 //####### TX BOARD TYPE #######
 // Enable one of the lines below (remove leading //)
@@ -55,10 +56,11 @@
 //#define BOARD_TYPE 4 // 4 = OpenLRSngTX / HawkEye UHF TX
 //#define BOARD_TYPE 5 // 5 = OpenLRSngRX-4/6ch (DTF UHF/HawkEye) (RX and TX supported)
 //#define BOARD_TYPE 6 // 6 = DTF UHF/HawkEye DeluxeTX (Atmega32u4)
+//#define BOARD_TYPE 9 // 9 = BroversityRX
 
-//### Module type selection (only for modified HW)
-//#define RFMXX_868
-//#define RFMXX_915
+//### Module type selection (default = 433, only needed for modified HW)
+//#define RFMTYPE 868
+//#define RFMTYPE 915
 
 //### Enabled Features (some features can be enabled / disabled with compile flag)
 #define CLI // Command-line interface
@@ -78,17 +80,21 @@
 #include <Arduino.h>
 
 #include "version.h"
+#include "binding.h"
 #include "hardware.h"
 #include "wd.h"
-#include "binding.h"
 #include "common.h"
 
-#ifdef COMPILE_TX
+#if (COMPILE_TX == 1)
 #include "binary_com.h"
+#include "rxc.h"
+#ifdef CLI_ENABLED
 #include "dialog.h"
+#endif
 #include "frskytx.h"
+#include "chpicker.h"
 #include "TX.h"
-#else // COMPILE_RX
+#else
 #include "I2C.h"
 #include "serialPPM.h"
 #include "RX.h"
